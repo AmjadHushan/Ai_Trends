@@ -1,7 +1,12 @@
 import sqlite3
 import datetime
+import json
 
 class DatabaseManager:
+    """
+    إدارة قاعدة البيانات المركزية لـ Ai_Trends (v2 - المترابطة بالكامل).
+    تخدم هؤلاء الوكلاء الخمسة، بوابات الرقابة، جدار الميزانية، وتوثيق C2PA.
+    """
     def __init__(self, db_name="ai_trends.db"):
         self.db_name = db_name
         self.init_database()
@@ -10,156 +15,186 @@ class DatabaseManager:
         return sqlite3.connect(self.db_name)
 
     def init_database(self):
-        """
-        إنشاء وتحديث الجداول الأساسية للنظام مع ربط أرشفة الفحوصات والامتثال 
-        مباشرة بـ video_id (segment_id) لكل فيديو.
-        """
+        """إنشاء الجداول لتدعم دورة حياة الفيديو كاملة وحالة الامتثال والتعلم"""
         with self.get_connection() as conn:
             cursor = conn.cursor()
+
+            # 1. الجدول الرئيسي لإدارة مقاطع وفيديوهات خط الإنتاج (Pipeline)
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS segments (
+                segment_id TEXT PRIMARY KEY,
+                trend_topic TEXT,
+                script_text TEXT,
+                visual_keywords TEXT,
+                audio_path TEXT,
+                video_path TEXT,
+                c2pa_manifest_path TEXT,
+                status TEXT DEFAULT 'DRAFT',                -- DRAFT, SCRIPT_GENERATED, APPROVED, PRODUCED, TELEGRAM_HOLD, PUBLISHED, REJECTED
+                sharia_status TEXT DEFAULT 'PENDING',        -- PENDING, APPROVED, REJECTED
+                sharia_feedback TEXT,                         -- لتخزين سبب الرفض والتعديل الموضعي
+                eu_law_status TEXT DEFAULT 'PENDING',        -- PENDING, APPROVED, REJECTED
+                eu_law_feedback TEXT,                        -- لتخزين ملاحظات القانون الأوروبي
+                fact_check_status TEXT DEFAULT 'PENDING',     -- PENDING, APPROVED, REJECTED
+                telegram_sent_at TEXT,                       -- لتتبع نافذة الـ 6 ساعات
+                is_human_approved INTEGER DEFAULT 0,          -- 1 = موافقة، -1 = رفض بشري، 0 = انتظار
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+            ''')
+
+            # 2. جدول أرشفة وتدقيق الامتثال (Compliance & Legal Sign-off) بعد النشر
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS compliance_signatures_audit (
+                video_id TEXT PRIMARY KEY,
+                video_hash TEXT,
+                publish_date TEXT,
+                platform_url TEXT,
+                is_sharia_approved INTEGER DEFAULT 0,
+                is_eu_law_approved INTEGER DEFAULT 0,
+                is_fact_checked INTEGER DEFAULT 0,
+                c2pa_verified INTEGER DEFAULT 0,
+                FOREIGN KEY(video_id) REFERENCES segments(segment_id)
+            )
+            ''')
+
+            # 3. الجدار المالي لربط استهلاك الميزانية بكل فيديو ووكيل بدقة
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS budget_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                segment_id TEXT,
+                agent_name TEXT,                             -- اسم الوكيل المستهلك
+                amount_spent REAL,                           -- التكلفة بالـ Tokens أو الدولار
+                billing_month TEXT,                          -- مثلاً: "2026-08"
+                timestamp TEXT DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(segment_id) REFERENCES segments(segment_id)
+            )
+            ''')
+
+            # 4. ذاكرة تعلم وكيل الكتابة (Granular Patching & Learning Repository)
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS agent_learning_memory (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                segment_id TEXT,
+                agent_type TEXT,                             -- sharia, eu_law, fact_check
+                failed_script TEXT,                          -- النص المرفوض
+                rejection_reason TEXT,                        -- سبب الرفض
+                corrected_script TEXT,                       -- النص المصحح الجديد
+                learned_rule TEXT,                           -- القاعدة المستخلصة للتعلم المستقبلي
+                timestamp TEXT DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(segment_id) REFERENCES segments(segment_id)
+            )
+            ''')
             
-            # 1. الجدول الأساسي لإدارة المقاطع والفيديو
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS segments (
-                    segment_id TEXT PRIMARY KEY,          -- هذا هو الـ video_id المرجعي
-                    script_text TEXT,
-                    audio_path TEXT,
-                    video_path TEXT,
-                    status TEXT DEFAULT 'PENDING',        -- الحالة العامة للفيديو
-                    fact_check_status TEXT DEFAULT 'PENDING' -- حالة موافقة المدقق المعلوماتي
-                )
-            ''')
+            conn.commit()
 
-            # 2. أرشفة سجل الامتثال والمسؤولية القانونية مربوطاً بـ video_id حتمياً
-            # يحفظ إثبات نجاح فحص كافة الوكلاء والمدقق لكل فيديو قبل مسح الميديا والنصوص
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS compliance_signatures_audit (
-                    video_id TEXT PRIMARY KEY,         -- مربوط مباشرة بـ segment_id للفيديو المؤرشف
-                    video_hash TEXT,                   -- البصمة الرقمية المشفرة SHA-256 للفيديو
-                    publish_date TEXT,                 -- تاريخ النشر الناجح
-                    platform_url TEXT,                 -- رابط الفيديو على المنصات
-                    is_sharia_approved INTEGER DEFAULT 0, -- إثبات موافقة الوكيل الشرعي
-                    is_eu_law_approved INTEGER DEFAULT 0,  -- إثبات موافقة وكيل القانون الأوروبي
-                    is_fact_checked INTEGER DEFAULT 0     -- إثبات موافقة المدقق المعلوماتي ومصداقية المحتوى
-                )
-            ''')
+    # ==================== دوال التحكم والربط (Pipeline API) ====================
 
-            # 3. جدول جدار الحماية المالي لمراقبة المصاريف الشهرية واليومية (الـ 20 يورو المرنة)
+    def create_segment_draft(self, segment_id, trend_topic, script_text, visual_keywords):
+        """يستدعيها وكيل الإدارة ووكيل الكتابة لتسجيل مسودة الفيديو"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
             cursor.execute('''
-                CREATE TABLE IF NOT EXISTS budget_logs (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    agent_name TEXT,
-                    amount_spent REAL,
-                    timestamp TEXT,
-                    billing_month TEXT 
-                )
-            ''')
+            INSERT INTO segments (segment_id, trend_topic, script_text, visual_keywords, status)
+            VALUES (?, ?, ?, ?, 'SCRIPT_GENERATED')
+            ''', (segment_id, trend_topic, script_text, visual_keywords))
+            conn.commit()
 
-            # 4. جدول تعقب العدادات والمحاولات الثلاث (منع الحلقات اللانهائية وتصفيرها)
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS retry_counters (
-                    process_key TEXT PRIMARY KEY, 
-                    retry_count INTEGER DEFAULT 0,
-                    last_attempt TEXT
-                )
-            ''')
+    def update_compliance_status(self, segment_id, agent_type, status, feedback=None):
+        """تحديث بوابة الرقابة (الشرعية أو القانونية) وتفعيل بروتوكول التعديل"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            if agent_type == 'sharia':
+                cursor.execute('''
+                UPDATE segments 
+                SET sharia_status = ?, sharia_feedback = ? 
+                WHERE segment_id = ?
+                ''', (status, feedback, segment_id))
+            elif agent_type == 'eu_law':
+                cursor.execute('''
+                UPDATE segments 
+                SET eu_law_status = ?, eu_law_feedback = ? 
+                WHERE segment_id = ?
+                ''', (status, feedback, segment_id))
+            elif agent_type == 'fact_check':
+                cursor.execute('''
+                UPDATE segments 
+                SET fact_check_status = ?, sharia_feedback = ? 
+                WHERE segment_id = ?
+                ''', (status, feedback, segment_id))
 
-            # 5. جدول القاعدة المعرفية لتعلم المدير (التحكم بالمكونات والأرباح)
+            # التحقق التلقائي: إذا تمت الموافقة من جميع الجهات الرقابية، تتغير الحالة الكلية لـ APPROVED
             cursor.execute('''
-                CREATE TABLE IF NOT EXISTS manager_knowledge_base (
-                    trend_topic TEXT PRIMARY KEY,
-                    expected_rpm REAL,
-                    actual_profit REAL,
-                    video_duration_type TEXT, 
-                    components_used TEXT,     
-                    performance_score REAL,
-                    last_updated TEXT
-                )
-            ''')
+            UPDATE segments
+            SET status = 'APPROVED'
+            WHERE segment_id = ? 
+              AND sharia_status = 'APPROVED' 
+              AND eu_law_status = 'APPROVED' 
+              AND fact_check_status = 'APPROVED'
+            ''', (segment_id,))
             
+            # إذا رفض أحد الوكلاء، يتم تحويل الحالة الكلية إلى REJECTED لبدء التعديل الموضعي
+            if status == 'REJECTED':
+                cursor.execute("UPDATE segments SET status = 'REJECTED' WHERE segment_id = ?", (segment_id,))
+                
             conn.commit()
 
-    # =========================================================================
-    # دالة تسجيل إيصال الامتثال القانوني المؤرشف بالـ video_id
-    # =========================================================================
-    def register_compliance_receipt(self, video_id, video_hash, platform_url, sharia, eu_law, fact_check):
-        """أرشفة حالة الفحوصات لكل فيديو مربوطاً بالـ video_id لحمايتك قانونياً وتوثيق النجاح"""
-        now = datetime.datetime.now().isoformat()
+    def log_learning(self, segment_id, agent_type, failed_script, rejection_reason, corrected_script, learned_rule):
+        """تسجيل الأخطاء لبروتوكول التعلم المستمر الخاص بوكيل الكتابة"""
         with self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute('''
-                INSERT OR REPLACE INTO compliance_signatures_audit 
-                (video_id, video_hash, publish_date, platform_url, is_sharia_approved, is_eu_law_approved, is_fact_checked)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            ''', (video_id, video_hash, platform_url, 1 if sharia else 0, 1 if eu_law else 0, 1 if fact_check else 0))
+            INSERT INTO agent_learning_memory (segment_id, agent_type, failed_script, rejection_reason, corrected_script, learned_rule)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ''', (segment_id, agent_type, failed_script, rejection_reason, corrected_script, learned_rule))
             conn.commit()
-            print(f"🔒 [Audit Archived] تم حفظ أرشفة فحوصات الفيديو بنجاح للـ ID: {video_id}")
 
-    # =========================================================================
-    # الدوال البرمجية الخاصة بجدار الحماية المالي (FinOps)
-    # =========================================================================
-    def log_api_transaction(self, agent_name, amount):
-        now = datetime.datetime.now()
-        billing_month = now.strftime("%Y-%m")
+    def log_budget(self, segment_id, agent_name, amount_spent):
+        """تسجيل فوري للميزانية لمنع تجاوز الجدار المالي المذكور في budget_telegram_interface"""
+        current_month = datetime.datetime.now().strftime("%Y-%m")
         with self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute('''
-                INSERT INTO budget_logs (agent_name, amount_spent, timestamp, billing_month)
-                VALUES (?, ?, ?, ?)
-            ''', (agent_name, amount, now.isoformat(), billing_month))
+            INSERT INTO budget_logs (segment_id, agent_name, amount_spent, billing_month)
+            VALUES (?, ?, ?, ?)
+            ''', (segment_id, agent_name, amount_spent, current_month))
             conn.commit()
 
-    def get_total_spent_for_month(self, current_month):
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute('SELECT SUM(amount_spent) FROM budget_logs WHERE billing_month = ?', (current_month,))
-            result = cursor.fetchone()
-            return result[0] if result and result[0] is not None else 0.0
-
-    # =========================================================================
-    # الدوال البرمجية الخاصة ببروتوكول المحاولات الثلاث والتصفير
-    # =========================================================================
-    def increment_retry_counter(self, process_key):
-        now = datetime.datetime.now().isoformat()
+    def set_telegram_hold(self, segment_id):
+        """تحديث الحالة بعد رندرة الفيديو وبدء نافذة الـ 6 ساعات لبوت التليجرام"""
+        now_str = datetime.datetime.now().isoformat()
         with self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute('''
-                INSERT INTO retry_counters (process_key, retry_count, last_attempt)
-                VALUES (?, 1, ?)
-                ON CONFLICT(process_key) DO UPDATE SET 
-                    retry_count = retry_count + 1,
-                    last_attempt = ?
-            ''', (process_key, now, now))
+            UPDATE segments 
+            SET status = 'TELEGRAM_HOLD', telegram_sent_at = ? 
+            WHERE segment_id = ?
+            ''', (now_str, segment_id))
             conn.commit()
 
-    def get_retry_count(self, process_key):
+    def get_pending_telegram_approvals(self):
+        """جلب المقاطع التي تنتظر مراجعة المطور في بوت التليجرام"""
         with self.get_connection() as conn:
+            conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
-            cursor.execute('SELECT retry_count FROM retry_counters WHERE process_key = ?', (process_key,))
-            result = cursor.fetchone()
-            return result[0] if result else 0
+            cursor.execute("SELECT * FROM segments WHERE status = 'TELEGRAM_HOLD' AND is_human_approved = 0")
+            return [dict(row) for row in cursor.fetchall()]
 
-    def reset_video_counters(self, process_key):
+    def finalize_publishing(self, segment_id, video_hash, platform_url):
+        """تسجيل المقطع كـ PUBLISHED ونقل بيانات التوقيع إلى جدول الـ Audit النهائي للتاريخ والتوثيق"""
         with self.get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute('DELETE FROM retry_counters WHERE process_key = ?', (process_key,))
-            conn.commit()
-            print(f"🔄 [Counter Reset] تم تصفير وإغلاق سجلات العملية: {process_key}")
-
-    # =========================================================================
-    # الدوال البرمجية الخاصة بذكاء وتعلّم المدير
-    # =========================================================================
-    def update_manager_knowledge(self, topic, expected_rpm, actual_profit, duration_type, components):
-        now = datetime.datetime.now().isoformat()
-        score = (actual_profit / (expected_rpm + 0.01)) * 100
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
+            # 1. تحديث الجدول الرئيسي
+            cursor.execute("UPDATE segments SET status = 'PUBLISHED' WHERE segment_id = ?", (segment_id,))
+            
+            # 2. نقل البيانات لجدول تدقيق الامتثال الشامل
+            now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             cursor.execute('''
-                INSERT INTO manager_knowledge_base 
-                (trend_topic, expected_rpm, actual_profit, video_duration_type, components_used, performance_score, last_updated)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(trend_topic) DO UPDATE SET
-                    actual_profit = ?,
-                    performance_score = ?,
-                    last_updated = ?
-            ''', (topic, expected_rpm, actual_profit, duration_type, components, score, now, actual_profit, score, now))
+            INSERT OR REPLACE INTO compliance_signatures_audit 
+            (video_id, video_hash, publish_date, platform_url, is_sharia_approved, is_eu_law_approved, is_fact_checked, c2pa_verified)
+            SELECT segment_id, ?, ?, ?, 
+                   (CASE WHEN sharia_status='APPROVED' THEN 1 ELSE 0 END),
+                   (CASE WHEN eu_law_status='APPROVED' THEN 1 ELSE 0 END),
+                   (CASE WHEN fact_check_status='APPROVED' THEN 1 ELSE 0 END),
+                   (CASE WHEN c2pa_manifest_path IS NOT NULL THEN 1 ELSE 0 END)
+            FROM segments WHERE segment_id = ?
+            ''', (video_hash, now_str, platform_url, segment_id))
             conn.commit()
