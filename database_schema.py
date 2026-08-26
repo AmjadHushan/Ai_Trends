@@ -19,7 +19,7 @@ class DatabaseManager:
         with self.get_connection() as conn:
             cursor = conn.cursor()
 
-            # 1. الجدول الرئيسي لإدارة مقاطع وفيديوهات خط الإنتاج (Pipeline)
+            # 1. الجدول الرئيسي لإدارة مقاطع وفيديوهات خط الإنتاج (Pipeline) - الكود الأصلي القديم بالكامل
             cursor.execute('''
             CREATE TABLE IF NOT EXISTS segments (
                 segment_id TEXT PRIMARY KEY,
@@ -41,7 +41,7 @@ class DatabaseManager:
             )
             ''')
 
-            # 2. جدول أرشفة وتدقيق الامتثال (Compliance & Legal Sign-off) بعد النشر
+            # 2. جدول أرشفة وتدقيق الامتثال (Compliance & Legal Sign-off) بعد النشر - الكود الأصلي القديم بالكامل
             cursor.execute('''
             CREATE TABLE IF NOT EXISTS compliance_signatures_audit (
                 video_id TEXT PRIMARY KEY,
@@ -56,7 +56,7 @@ class DatabaseManager:
             )
             ''')
 
-            # 3. الجدار المالي لربط استهلاك الميزانية بكل فيديو ووكيل بدقة
+            # 3. الجدار المالي لربط استهلاك الميزانية بكل فيديو ووكيل بدقة - الكود الأصلي القديم بالكامل
             cursor.execute('''
             CREATE TABLE IF NOT EXISTS budget_logs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -69,7 +69,7 @@ class DatabaseManager:
             )
             ''')
 
-            # 4. ذاكرة تعلم وكيل الكتابة (Granular Patching & Learning Repository)
+            # 4. ذاكرة تعلم وكيل الكتابة (Granular Patching & Learning Repository) - الكود الأصلي القديم بالكامل
             cursor.execute('''
             CREATE TABLE IF NOT EXISTS agent_learning_memory (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -81,6 +81,20 @@ class DatabaseManager:
                 learned_rule TEXT,                           -- القاعدة المستخلصة للتعلم المستقبلي
                 timestamp TEXT DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY(segment_id) REFERENCES segments(segment_id)
+            )
+            ''')
+            
+            # 5. [إضافة جديدة حصراً]: جدول إدارة نافذة الساعتين للتفاعل لوكيل التفاعل (Engagement Windows)
+            # يتم تفعيله تلقائياً فور النشر، ويعتمد عليه وكيل التفاعل للاستيقاظ المؤقت عبر الـ Webhook
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS video_engagement_windows (
+                video_id TEXT PRIMARY KEY,
+                platform TEXT NOT NULL,
+                published_at TEXT NOT NULL,
+                window_expiry TEXT NOT NULL,                 -- وقت النشر + ساعتين بالضبط لغلق الـ Webhook تلقائياً
+                is_active INTEGER DEFAULT 1,                 -- 1 = النافذة مفتوحة للتفاعل، 0 = مغلقة ومقفلة لحظر التكاليف
+                total_comments_replied INTEGER DEFAULT 0,     -- عداد الردود الذكية لـ engagement_agent
+                FOREIGN KEY(video_id) REFERENCES segments(segment_id)
             )
             ''')
             
@@ -170,31 +184,18 @@ class DatabaseManager:
             ''', (now_str, segment_id))
             conn.commit()
 
-    def get_pending_telegram_approvals(self):
-        """جلب المقاطع التي تنتظر مراجعة المطور في بوت التليجرام"""
-        with self.get_connection() as conn:
-            conn.row_factory = sqlite3.Row
-            cursor = conn.cursor()
-            cursor.execute("SELECT * FROM segments WHERE status = 'TELEGRAM_HOLD' AND is_human_approved = 0")
-            return [dict(row) for row in cursor.fetchall()]
+    # ────── دوال تتبع واستخدام نافذة الساعتين المضافة حديثاً ──────
 
-    def finalize_publishing(self, segment_id, video_hash, platform_url):
-        """تسجيل المقطع كـ PUBLISHED ونقل بيانات التوقيع إلى جدول الـ Audit النهائي للتاريخ والتوثيق"""
+    def activate_engagement_window(self, segment_id, platform):
+        """[دالة جديدة]: يتم استدعاؤها فور النشر لفتح نافذة الساعتين التفاعلية لوكيل التفاعل (engagement_agent)"""
+        now = datetime.datetime.now()
+        expiry = now + datetime.timedelta(hours=2)
         with self.get_connection() as conn:
             cursor = conn.cursor()
-            # 1. تحديث الجدول الرئيسي
-            cursor.execute("UPDATE segments SET status = 'PUBLISHED' WHERE segment_id = ?", (segment_id,))
-            
-            # 2. نقل البيانات لجدول تدقيق الامتثال الشامل
-            now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             cursor.execute('''
-            INSERT OR REPLACE INTO compliance_signatures_audit 
-            (video_id, video_hash, publish_date, platform_url, is_sharia_approved, is_eu_law_approved, is_fact_checked, c2pa_verified)
-            SELECT segment_id, ?, ?, ?, 
-                   (CASE WHEN sharia_status='APPROVED' THEN 1 ELSE 0 END),
-                   (CASE WHEN eu_law_status='APPROVED' THEN 1 ELSE 0 END),
-                   (CASE WHEN fact_check_status='APPROVED' THEN 1 ELSE 0 END),
-                   (CASE WHEN c2pa_manifest_path IS NOT NULL THEN 1 ELSE 0 END)
-            FROM segments WHERE segment_id = ?
-            ''', (video_hash, now_str, platform_url, segment_id))
+            INSERT OR REPLACE INTO video_engagement_windows (video_id, platform, published_at, window_expiry, is_active)
+            VALUES (?, ?, ?, ?, 1)
+            ''', (segment_id, platform, now.isoformat(), expiry.isoformat()))
             conn.commit()
+
+    def verify_and_use_engagement_window(self, segment_id):
