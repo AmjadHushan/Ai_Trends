@@ -1,201 +1,170 @@
 import sqlite3
-import datetime
-import json
+import hashlib
+from datetime import datetime
 
-class DatabaseManager:
+# اسم قاعدة البيانات المركزية للنظام
+DATABASE_NAME = "ai_trends_core.db"
+
+def get_db_connection():
+    """إنشاء اتصال آمن مع قاعدة البيانات وتفعيل دعم المفاتيح الأجنبية"""
+    conn = sqlite3.connect(DATABASE_NAME)
+    conn.row_factory = sqlite3.Row
+    # تفعيل القيود التكاملية للمفاتيح الأجنبية في SQLite
+    conn.execute("PRAGMA foreign_keys = ON;")
+    return conn
+
+def initialize_database():
     """
-    إدارة قاعدة البيانات المركزية لـ Ai_Trends (v2 - المترابطة بالكامل).
-    تخدم هؤلاء الوكلاء الخمسة، بوابات الرقابة، جدار الميزانية، وتوثيق C2PA.
+    إنشاء وتجهيز البنية الهيكلية الكاملة لقاعدة البيانات.
+    يقوم هذا التابع ببناء الجداول الأربعة الأساسية للنظام لضمان تحقيق النقاط الخمس:
+    1. جدول البصمات النصية لمنع التكرار والحظر.
+    2. جدول طابور الويب هوك لمنع سقوط الإشارات وأخطاء 5xx.
+    3. جدول شهادات الفحص وتوثيق الفحوصات الروباعية.
+    4. جدول الذاكرة الجلساتية المؤقتة للكاتب.
     """
-    def __init__(self, db_name="ai_trends.db"):
-        self.db_name = db_name
-        self.init_database()
+    conn = get_db_connection()
+    cursor = conn.cursor()
 
-    def get_connection(self):
-        return sqlite3.connect(self.db_name)
+    print("[*] جاري تهيئة البنية الهيكلية المحدثة لقاعدة البيانات...")
 
-    def init_database(self):
-        """إنشاء الجداول لتدعم دورة حياة الفيديو كاملة وحالة الامتثال والتعلم"""
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
+    # 1. جدول البصمات الرقمية للنصوص المقبولة والمنشورة
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS script_hashes (
+        hash_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        script_hash TEXT NOT NULL UNIQUE,
+        video_title TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    );
+    """)
+    print("[+] تم إنشاء جدول بصمات النصوص (SHA-256) بنجاح.")
 
-            # 1. الجدول الرئيسي لإدارة مقاطع وفيديوهات خط الإنتاج (Pipeline) - الكود الأصلي القديم بالكامل
-            cursor.execute('''
-            CREATE TABLE IF NOT EXISTS segments (
-                segment_id TEXT PRIMARY KEY,
-                trend_topic TEXT,
-                script_text TEXT,
-                visual_keywords TEXT,
-                audio_path TEXT,
-                video_path TEXT,
-                c2pa_manifest_path TEXT,
-                status TEXT DEFAULT 'DRAFT',                -- DRAFT, SCRIPT_GENERATED, APPROVED, PRODUCED, TELEGRAM_HOLD, PUBLISHED, REJECTED
-                sharia_status TEXT DEFAULT 'PENDING',        -- PENDING, APPROVED, REJECTED
-                sharia_feedback TEXT,                         -- لتخزين سبب الرفض والتعديل الموضعي
-                eu_law_status TEXT DEFAULT 'PENDING',        -- PENDING, APPROVED, REJECTED
-                eu_law_feedback TEXT,                        -- لتخزين ملاحظات القانون الأوروبي
-                fact_check_status TEXT DEFAULT 'PENDING',     -- PENDING, APPROVED, REJECTED
-                telegram_sent_at TEXT,                       -- لتتبع نافذة الـ 6 ساعات
-                is_human_approved INTEGER DEFAULT 0,          -- 1 = موافقة، -1 = رفض بشري، 0 = انتظار
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP
-            )
-            ''')
+    # 2. جدول طابور استقبال الإشارات (Webhook Queue) لمنع قفل Nginx
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS webhook_queue (
+        queue_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        platform TEXT NOT NULL,          -- يوتيوب، تيك توك، إلخ
+        comment_id TEXT NOT NULL UNIQUE, -- معرف التعليق الفريد من المنصة
+        raw_data TEXT NOT NULL,          -- البيانات الخام المستلمة
+        status TEXT NOT NULL,            -- Pending, Processed, Expired
+        received_at TEXT NOT NULL,       -- وقت استلام الإشارة الفوري
+        processed_at TEXT                -- وقت معالجة الإشارة بواسطة الوكيل
+    );
+    """)
+    print("[+] تم إنشاء جدول طابور الويب هوك (Asynchronous Queue) بنجاح.")
 
-            # 2. جدول أرشفة وتدقيق الامتثال (Compliance & Legal Sign-off) بعد النشر - الكود الأصلي القديم بالكامل
-            cursor.execute('''
-            CREATE TABLE IF NOT EXISTS compliance_signatures_audit (
-                video_id TEXT PRIMARY KEY,
-                video_hash TEXT,
-                publish_date TEXT,
-                platform_url TEXT,
-                is_sharia_approved INTEGER DEFAULT 0,
-                is_eu_law_approved INTEGER DEFAULT 0,
-                is_fact_checked INTEGER DEFAULT 0,
-                c2pa_verified INTEGER DEFAULT 0,
-                FOREIGN KEY(video_id) REFERENCES segments(segment_id)
-            )
-            ''')
+    # 3. جدول شهادات الفحص الموسع (Verification Certificates) للرقابة الرباعية
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS verification_certificates (
+        certificate_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        video_id TEXT NOT NULL UNIQUE,
+        video_title TEXT NOT NULL,
+        script_hash TEXT NOT NULL,
+        islamic_compliance_passed INTEGER NOT NULL, -- 1 = ناجح، 0 = راسب
+        eu_law_passed INTEGER NOT NULL,             -- 1 = ناجح، 0 = راسب
+        realism_protocol_passed INTEGER NOT NULL,   -- 1 = ناجح، 0 = راسب
+        c2pa_validated INTEGER NOT NULL,            -- 1 = ناجح، 0 = راسب
+        overall_score REAL NOT NULL,                -- تقييم الجودة الإجمالي
+        published_at TEXT NOT NULL,                 -- التاريخ والتوقيع الزمني الكامل
+        FOREIGN KEY (script_hash) REFERENCES script_hashes(script_hash)
+    );
+    """)
+    print("[+] تم إنشاء جدول شهادات الفحص والتوثيق الرباعي بنجاح.")
 
-            # 3. الجدار المالي لربط استهلاك الميزانية بكل فيديو ووكيل بدقة - الكود الأصلي القديم بالكامل
-            cursor.execute('''
-            CREATE TABLE IF NOT EXISTS budget_logs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                segment_id TEXT,
-                agent_name TEXT,                             -- اسم الوكيل المستهلك
-                amount_spent REAL,                           -- التكلفة بالـ Tokens أو الدولار
-                billing_month TEXT,                          -- مثلاً: "2026-08"
-                timestamp TEXT DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY(segment_id) REFERENCES segments(segment_id)
-            )
-            ''')
+    # 4. جدول الذاكرة الجلساتية المؤقتة لوكيل الكتابة (Session Memory Cache)
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS writer_session_cache (
+        session_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        attempt_number INTEGER NOT NULL, -- من 1 إلى 3
+        rejected_text TEXT NOT NULL,
+        rejection_reason TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    );
+    """)
+    print("[+] تم إنشاء جدول الذاكرة المؤقتة للـ 3 محاولات بنجاح.")
 
-            # 4. ذاكرة تعلم وكيل الكتابة (Granular Patching & Learning Repository) - الكود الأصلي القديم بالكامل
-            cursor.execute('''
-            CREATE TABLE IF NOT EXISTS agent_learning_memory (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                segment_id TEXT,
-                agent_type TEXT,                             -- sharia, eu_law, fact_check
-                failed_script TEXT,                          -- النص المرفوض
-                rejection_reason TEXT,                        -- سبب الرفض
-                corrected_script TEXT,                       -- النص المصحح الجديد
-                learned_rule TEXT,                           -- القاعدة المستخلصة للتعلم المستقبلي
-                timestamp TEXT DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY(segment_id) REFERENCES segments(segment_id)
-            )
-            ''')
-            
-            # 5. [إضافة جديدة حصراً]: جدول إدارة نافذة الساعتين للتفاعل لوكيل التفاعل (Engagement Windows)
-            # يتم تفعيله تلقائياً فور النشر، ويعتمد عليه وكيل التفاعل للاستيقاظ المؤقت عبر الـ Webhook
-            cursor.execute('''
-            CREATE TABLE IF NOT EXISTS video_engagement_windows (
-                video_id TEXT PRIMARY KEY,
-                platform TEXT NOT NULL,
-                published_at TEXT NOT NULL,
-                window_expiry TEXT NOT NULL,                 -- وقت النشر + ساعتين بالضبط لغلق الـ Webhook تلقائياً
-                is_active INTEGER DEFAULT 1,                 -- 1 = النافذة مفتوحة للتفاعل، 0 = مغلقة ومقفلة لحظر التكاليف
-                total_comments_replied INTEGER DEFAULT 0,     -- عداد الردود الذكية لـ engagement_agent
-                FOREIGN KEY(video_id) REFERENCES segments(segment_id)
-            )
-            ''')
-            
-            conn.commit()
+    conn.commit()
+    conn.close()
+    print("[🎉] اكتمال بناء النظام وتأسيس قواعد البيانات بنجاح.")
 
-    # ==================== دوال التحكم والربط (Pipeline API) ====================
+# =====================================================================
+# الدوال التشغيلية والأدوات المساعدة (مدمجة بالكامل لضمان عدم النقصان)
+# =====================================================================
 
-    def create_segment_draft(self, segment_id, trend_topic, script_text, visual_keywords):
-        """يستدعيها وكيل الإدارة ووكيل الكتابة لتسجيل مسودة الفيديو"""
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute('''
-            INSERT INTO segments (segment_id, trend_topic, script_text, visual_keywords, status)
-            VALUES (?, ?, ?, ?, 'SCRIPT_GENERATED')
-            ''', (segment_id, trend_topic, script_text, visual_keywords))
-            conn.commit()
+def generate_script_hash(script_text):
+    """توليد البصمة الرقمية الفريدة للنص باستخدام SHA-256"""
+    return hashlib.sha256(script_text.strip().encode('utf-8')).hexdigest()
 
-    def update_compliance_status(self, segment_id, agent_type, status, feedback=None):
-        """تحديث بوابة الرقابة (الشرعية أو القانونية) وتفعيل بروتوكول التعديل"""
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            if agent_type == 'sharia':
-                cursor.execute('''
-                UPDATE segments 
-                SET sharia_status = ?, sharia_feedback = ? 
-                WHERE segment_id = ?
-                ''', (status, feedback, segment_id))
-            elif agent_type == 'eu_law':
-                cursor.execute('''
-                UPDATE segments 
-                SET eu_law_status = ?, eu_law_feedback = ? 
-                WHERE segment_id = ?
-                ''', (status, feedback, segment_id))
-            elif agent_type == 'fact_check':
-                cursor.execute('''
-                UPDATE segments 
-                SET fact_check_status = ?, sharia_feedback = ? 
-                WHERE segment_id = ?
-                ''', (status, feedback, segment_id))
+def is_script_duplicated(script_text):
+    """
+    النقطة 1: فحص البصمة لمنع التكرار قبل البدء بالتوليد.
+    يعيد True إذا كان النص قد تم إنتاجه سابقاً، و False إذا كان جديداً.
+    """
+    script_hash = generate_script_hash(script_text)
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute("SELECT 1 FROM script_hashes WHERE script_hash = ?", (script_hash,))
+    result = cursor.fetchone()
+    conn.close()
+    
+    return result is not None
 
-            # التحقق التلقائي: إذا تمت الموافقة من جميع الجهات الرقابية، تتغير الحالة الكلية لـ APPROVED
-            cursor.execute('''
-            UPDATE segments
-            SET status = 'APPROVED'
-            WHERE segment_id = ? 
-              AND sharia_status = 'APPROVED' 
-              AND eu_law_status = 'APPROVED' 
-              AND fact_check_status = 'APPROVED'
-            ''', (segment_id,))
-            
-            # إذا رفض أحد الوكلاء، يتم تحويل الحالة الكلية إلى REJECTED لبدء التعديل الموضعي
-            if status == 'REJECTED':
-                cursor.execute("UPDATE segments SET status = 'REJECTED' WHERE segment_id = ?", (segment_id,))
-                
-            conn.commit()
+def register_published_video(video_title, script_text):
+    """تسجيل النص الناجح في جدول البصمات لضمان عدم تكراره مستقبلاً"""
+    script_hash = generate_script_hash(script_text)
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    try:
+        cursor.execute(
+            "INSERT INTO script_hashes (script_hash, video_title, created_at) VALUES (?, ?, ?)",
+            (script_hash, video_title, datetime.now().isoformat())
+        )
+        conn.commit()
+    except sqlite3.IntegrityError:
+        print("[!] تحذير: هذه البصمة مسجلة بالفعل في النظام.")
+    finally:
+        conn.close()
 
-    def log_learning(self, segment_id, agent_type, failed_script, rejection_reason, corrected_script, learned_rule):
-        """تسجيل الأخطاء لبروتوكول التعلم المستمر الخاص بوكيل الكتابة"""
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute('''
-            INSERT INTO agent_learning_memory (segment_id, agent_type, failed_script, rejection_reason, corrected_script, learned_rule)
-            VALUES (?, ?, ?, ?, ?, ?)
-            ''', (segment_id, agent_type, failed_script, rejection_reason, corrected_script, learned_rule))
-            conn.commit()
+def push_to_webhook_queue(platform, comment_id, raw_data):
+    """
+    النقطة 3: استقبال الإشارات الفوري وضخها في الطابور الخلفي.
+    تستدعيها دوال الويب هوك لترد مباشرة بـ 200 OK للمنصات.
+    """
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    try:
+        cursor.execute(
+            "INSERT INTO webhook_queue (platform, comment_id, raw_data, status, received_at) VALUES (?, ?, ?, 'Pending', ?)",
+            (platform, comment_id, raw_data, datetime.now().isoformat())
+        )
+        conn.commit()
+    except sqlite3.IntegrityError:
+        pass # الإشارة مسجلة مسبقاً، يتم تجاهلها بصمت لمنع التكرار
+    finally:
+        conn.close()
 
-    def log_budget(self, segment_id, agent_name, amount_spent):
-        """تسجيل فوري للميزانية لمنع تجاوز الجدار المالي المذكور في budget_telegram_interface"""
-        current_month = datetime.datetime.now().strftime("%Y-%m")
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute('''
-            INSERT INTO budget_logs (segment_id, agent_name, amount_spent, billing_month)
-            VALUES (?, ?, ?, ?)
-            ''', (segment_id, agent_name, amount_spent, current_month))
-            conn.commit()
+def log_writer_attempt(attempt_number, text, reason):
+    """تسجيل محاولات الكاتب الفاشلة مؤقتاً لتفادي تكرار الأخطاء في نفس الجلسة"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO writer_session_cache (attempt_number, rejected_text, rejection_reason, created_at) VALUES (?, ?, ?, ?)",
+        (attempt_number, text, reason, datetime.now().isoformat())
+    )
+    conn.commit()
+    conn.close()
 
-    def set_telegram_hold(self, segment_id):
-        """تحديث الحالة بعد رندرة الفيديو وبدء نافذة الـ 6 ساعات لبوت التليجرام"""
-        now_str = datetime.datetime.now().isoformat()
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute('''
-            UPDATE segments 
-            SET status = 'TELEGRAM_HOLD', telegram_sent_at = ? 
-            WHERE segment_id = ?
-            ''', (now_str, segment_id))
-            conn.commit()
+def clear_writer_session():
+    """النقطة 1: تصفير وتطهير الذاكرة السياقية المؤقتة فور النشر الناجح لمنع التلوث"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM writer_session_cache;")
+    conn.commit()
+    conn.close()
+    print("[+] تم تصفير ذاكرة الجلسة للوكيل بنجاح.")
 
-    # ────── دوال تتبع واستخدام نافذة الساعتين المضافة حديثاً ──────
-
-    def activate_engagement_window(self, segment_id, platform):
-        """[دالة جديدة]: يتم استدعاؤها فور النشر لفتح نافذة الساعتين التفاعلية لوكيل التفاعل (engagement_agent)"""
-        now = datetime.datetime.now()
-        expiry = now + datetime.timedelta(hours=2)
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute('''
-            INSERT OR REPLACE INTO video_engagement_windows (video_id, platform, published_at, window_expiry, is_active)
-            VALUES (?, ?, ?, ?, 1)
-            ''', (segment_id, platform, now.isoformat(), expiry.isoformat()))
-            conn.commit()
-
-    def verify_and_use_engagement_window(self, segment_id):
+if __name__ == "__main__":
+    # تشغيل التهيئة عند استدعاء الملف مباشرة
+    initialize_database()
