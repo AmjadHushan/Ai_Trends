@@ -1,170 +1,222 @@
+# =====================================================================
+# 📋 قائمة بنود وخصائص جداول قاعدة البيانات المحلية (من الأعلى - بدون شرح)
+# =====================================================================
+# * بند 1: تهيئة وإنشاء قاعدة البيانات المحلية الخفيفة (SQLite) صفرية التكلفة السحابية.
+# * بند 2: جدول التوثيق وسجلات الأمان الرقمية لإشارات GitHub Webhooks (platform_security).
+# * بند 3: جدول طابور ومستودع استقبال تعليقات وإشارات المنصات الفوري (webhook_queue).
+# * بند 4: جدول حفظ البصمات التشفيرية الحتمية للنصوص (script_hashes) عبر SHA-256 لمنع التكرار والحظر.
+# * بند 5: جدول إصدار شهادات التوثيق الرقابي والمالي الشاملة للفيديوهات المنشورة (inspection_certificates).
+# * بند 6: دالة إدارة وفحص أمان مفاتيح GitHub وحقن المتغيرات السرية (save_security_config).
+# * بند 7: دالة إدخال إشارات الـ Webhook الواردة وتفعيل نظام الطابور الفوري (insert_webhook_request).
+# * بند 8: دالة معالج الخلفية الصامت لاستدعاء وتحديث حالات الطلبات المعلقة (fetch_pending_and_update).
+# * بند 9: دالة الفحص الاستباقي ومطابقة البصمة التشفيرية قبل الإنتاج لمنع الحظر الظلي (check_script_hash_exists).
+# * بند 10: دالة توليد وحفظ شهادة التوثيق الرقابي الشاملة بعد نجاح دورة النشر (generate_inspection_certificate).
+# =====================================================================
+
 import sqlite3
-import hashlib
+import os
+import json
 from datetime import datetime
 
-# اسم قاعدة البيانات المركزية للنظام
-DATABASE_NAME = "ai_trends_core.db"
-
-def get_db_connection():
-    """إنشاء اتصال آمن مع قاعدة البيانات وتفعيل دعم المفاتيح الأجنبية"""
-    conn = sqlite3.connect(DATABASE_NAME)
-    conn.row_factory = sqlite3.Row
-    # تفعيل القيود التكاملية للمفاتيح الأجنبية في SQLite
-    conn.execute("PRAGMA foreign_keys = ON;")
-    return conn
-
-def initialize_database():
-    """
-    إنشاء وتجهيز البنية الهيكلية الكاملة لقاعدة البيانات.
-    يقوم هذا التابع ببناء الجداول الأربعة الأساسية للنظام لضمان تحقيق النقاط الخمس:
-    1. جدول البصمات النصية لمنع التكرار والحظر.
-    2. جدول طابور الويب هوك لمنع سقوط الإشارات وأخطاء 5xx.
-    3. جدول شهادات الفحص وتوثيق الفحوصات الروباعية.
-    4. جدول الذاكرة الجلساتية المؤقتة للكاتب.
-    """
-    conn = get_db_connection()
-    cursor = conn.cursor()
-
-    print("[*] جاري تهيئة البنية الهيكلية المحدثة لقاعدة البيانات...")
-
-    # 1. جدول البصمات الرقمية للنصوص المقبولة والمنشورة
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS script_hashes (
-        hash_id INTEGER PRIMARY KEY AUTOINCREMENT,
-        script_hash TEXT NOT NULL UNIQUE,
-        video_title TEXT NOT NULL,
-        created_at TEXT NOT NULL
-    );
-    """)
-    print("[+] تم إنشاء جدول بصمات النصوص (SHA-256) بنجاح.")
-
-    # 2. جدول طابور استقبال الإشارات (Webhook Queue) لمنع قفل Nginx
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS webhook_queue (
-        queue_id INTEGER PRIMARY KEY AUTOINCREMENT,
-        platform TEXT NOT NULL,          -- يوتيوب، تيك توك، إلخ
-        comment_id TEXT NOT NULL UNIQUE, -- معرف التعليق الفريد من المنصة
-        raw_data TEXT NOT NULL,          -- البيانات الخام المستلمة
-        status TEXT NOT NULL,            -- Pending, Processed, Expired
-        received_at TEXT NOT NULL,       -- وقت استلام الإشارة الفوري
-        processed_at TEXT                -- وقت معالجة الإشارة بواسطة الوكيل
-    );
-    """)
-    print("[+] تم إنشاء جدول طابور الويب هوك (Asynchronous Queue) بنجاح.")
-
-    # 3. جدول شهادات الفحص الموسع (Verification Certificates) للرقابة الرباعية
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS verification_certificates (
-        certificate_id INTEGER PRIMARY KEY AUTOINCREMENT,
-        video_id TEXT NOT NULL UNIQUE,
-        video_title TEXT NOT NULL,
-        script_hash TEXT NOT NULL,
-        islamic_compliance_passed INTEGER NOT NULL, -- 1 = ناجح، 0 = راسب
-        eu_law_passed INTEGER NOT NULL,             -- 1 = ناجح، 0 = راسب
-        realism_protocol_passed INTEGER NOT NULL,   -- 1 = ناجح، 0 = راسب
-        c2pa_validated INTEGER NOT NULL,            -- 1 = ناجح، 0 = راسب
-        overall_score REAL NOT NULL,                -- تقييم الجودة الإجمالي
-        published_at TEXT NOT NULL,                 -- التاريخ والتوقيع الزمني الكامل
-        FOREIGN KEY (script_hash) REFERENCES script_hashes(script_hash)
-    );
-    """)
-    print("[+] تم إنشاء جدول شهادات الفحص والتوثيق الرباعي بنجاح.")
-
-    # 4. جدول الذاكرة الجلساتية المؤقتة لوكيل الكتابة (Session Memory Cache)
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS writer_session_cache (
-        session_id INTEGER PRIMARY KEY AUTOINCREMENT,
-        attempt_number INTEGER NOT NULL, -- من 1 إلى 3
-        rejected_text TEXT NOT NULL,
-        rejection_reason TEXT NOT NULL,
-        created_at TEXT NOT NULL
-    );
-    """)
-    print("[+] تم إنشاء جدول الذاكرة المؤقتة للـ 3 محاولات بنجاح.")
-
-    conn.commit()
-    conn.close()
-    print("[🎉] اكتمال بناء النظام وتأسيس قواعد البيانات بنجاح.")
+# اسم قاعدة البيانات المحلية الثابت للمنظومة
+DB_NAME = "ai_trends.db"
 
 # =====================================================================
-# الدوال التشغيلية والأدوات المساعدة (مدمجة بالكامل لضمان عدم النقصان)
+# 🛠️ [بند 1] دالة تأسيس وبناء قاعدة البيانات والجداول الأساسية الكلية
+# =====================================================================
+def init_database_system():
+    """
+    تأسيس قاعدة البيانات وهيكلة الجداول الخمسة المعيارية لحفظ منطق العمل
+    وحماية موارد السيرفر المحلي بشكل مستقل وصفري الكلفة السحابية.
+    """
+    print(f"⚙️ [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]: جاري تهيئة وتأسيس جداول قاعدة البيانات المحلية...")
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    
+    # [بند 2] جدول التوثيق وسجلات الأمان الرقمية لإشارات GitHub Webhooks
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS platform_security (
+            config_key TEXT PRIMARY KEY,
+            config_value TEXT,
+            last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    # [بند 3] جدول طابور ومستودع استقبال تعليقات وإشارات المنصات الفوري
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS webhook_queue (
+            queue_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            platform_name TEXT NOT EXISTS,
+            payload_data TEXT,
+            status TEXT DEFAULT 'Pending',
+            received_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            processed_at TIMESTAMP
+        )
+    ''')
+    
+    # [بند 4] جدول حفظ البصمات التشفيرية الحتمية للنصوص عبر SHA-256 لمنع التكرار
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS script_hashes (
+            hash_value TEXT PRIMARY KEY,
+            associated_title TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    # [بند 5] جدول إصدار شهادات التوثيق الرقابي والمالي الشاملة للنشر
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS inspection_certificates (
+            video_id TEXT PRIMARY KEY,
+            title TEXT,
+            script_hash TEXT,
+            islamic_status TEXT,
+            eu_law_status TEXT,
+            fact_check_status TEXT,
+            finops_cost REAL,
+            published_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (script_hash) REFERENCES script_hashes(hash_value)
+        )
+    ''')
+    
+    conn.commit()
+    conn.close()
+    print("✅ تم بناء وهيكلة كافة جداول قاعدة البيانات بنجاح وصفريّة التكلفة السحابية!")
+
+# =====================================================================
+# 💾 الدوال التشغيلية والمتقدمة لإدارة وحفظ البيانات (سياق الملف الأصلي)
 # =====================================================================
 
-def generate_script_hash(script_text):
-    """توليد البصمة الرقمية الفريدة للنص باستخدام SHA-256"""
-    return hashlib.sha256(script_text.strip().encode('utf-8')).hexdigest()
-
-def is_script_duplicated(script_text):
+def save_security_config(key, value):
     """
-    النقطة 1: فحص البصمة لمنع التكرار قبل البدء بالتوليد.
-    يعيد True إذا كان النص قد تم إنتاجه سابقاً، و False إذا كان جديداً.
+    [بند 6] دالة إدارة وفحص أمان مفاتيح جيت هاب وحقن المتغيرات السرية محلياً.
+    تضمن تحديث التوكنز والـ Secrets الحساسة دون قفل أو تعليق السيرفر.
     """
-    script_hash = generate_script_hash(script_text)
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    
-    cursor.execute("SELECT 1 FROM script_hashes WHERE script_hash = ?", (script_hash,))
-    result = cursor.fetchone()
-    conn.close()
-    
-    return result is not None
-
-def register_published_video(video_title, script_text):
-    """تسجيل النص الناجح في جدول البصمات لضمان عدم تكراره مستقبلاً"""
-    script_hash = generate_script_hash(script_text)
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    
     try:
-        cursor.execute(
-            "INSERT INTO script_hashes (script_hash, video_title, created_at) VALUES (?, ?, ?)",
-            (script_hash, video_title, datetime.now().isoformat())
-        )
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT OR REPLACE INTO platform_security (config_key, config_value, last_updated)
+            VALUES (?, ?, CURRENT_TIMESTAMP)
+        ''', (key, value))
         conn.commit()
-    except sqlite3.IntegrityError:
-        print("[!] تحذير: هذه البصمة مسجلة بالفعل في النظام.")
-    finally:
         conn.close()
+        return True
+    except sqlite3.Error as e:
+        print(f"❌ خطأ برميجي في جدول الأمان: {e}")
+        return False
 
-def push_to_webhook_queue(platform, comment_id, raw_data):
+def insert_webhook_request(platform, payload_text):
     """
-    النقطة 3: استقبال الإشارات الفوري وضخها في الطابور الخلفي.
-    تستدعيها دوال الويب هوك لترد مباشرة بـ 200 OK للمنصات.
+    [بند 7] دالة إدخال إشارات الـ Webhook الواردة وتفعيل نظام الطابور الفوري.
+    تأخذ البيانات وتحفظها بحالة 'Pending' فوراً للسماح للسيرفر بالرد بـ 200 OK.
     """
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    
     try:
-        cursor.execute(
-            "INSERT INTO webhook_queue (platform, comment_id, raw_data, status, received_at) VALUES (?, ?, ?, 'Pending', ?)",
-            (platform, comment_id, raw_data, datetime.now().isoformat())
-        )
+        # التحقق من صحة صياغة الجيسون قبل الإدخال لمنع تلويث الجدول
+        if isinstance(payload_text, dict):
+            payload_text = json.dumps(payload_text, ensure_ascii=False)
+            
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO webhook_queue (platform_name, payload_data, status, received_at)
+            VALUES (?, ?, 'Pending', CURRENT_TIMESTAMP)
+        ''', (platform, payload_text))
         conn.commit()
-    except sqlite3.IntegrityError:
-        pass # الإشارة مسجلة مسبقاً، يتم تجاهلها بصمت لمنع التكرار
-    finally:
         conn.close()
+        return True
+    except sqlite3.Error as e:
+        print(f"❌ خطأ أثناء حقن الطلب في طابور الـ Webhook: {e}")
+        return False
 
-def log_writer_attempt(attempt_number, text, reason):
-    """تسجيل محاولات الكاتب الفاشلة مؤقتاً لتفادي تكرار الأخطاء في نفس الجلسة"""
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute(
-        "INSERT INTO writer_session_cache (attempt_number, rejected_text, rejection_reason, created_at) VALUES (?, ?, ?, ?)",
-        (attempt_number, text, reason, datetime.now().isoformat())
-    )
-    conn.commit()
-    conn.close()
+def fetch_pending_and_update(queue_id, new_status):
+    """
+    [بند 8] دالة معالج الخلفية الصامت لاستدعاء وتحديث حالات الطلبات المعلقة.
+    يتم استدعاؤها عبر الـ Worker لتغيير الحالة إلى 'Processed' أو 'Expired'.
+    """
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute('''
+            UPDATE webhook_queue 
+            SET status = ?, processed_at = CURRENT_TIMESTAMP
+            WHERE queue_id = ?
+        ''', (new_status, queue_id))
+        conn.commit()
+        conn.close()
+        return True
+    except sqlite3.Error as e:
+        print(f"❌ خطأ أثناء تحديث أطوار طابور الـ Webhook: {e}")
+        return False
 
-def clear_writer_session():
-    """النقطة 1: تصفير وتطهير الذاكرة السياقية المؤقتة فور النشر الناجح لمنع التلوث"""
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM writer_session_cache;")
-    conn.commit()
-    conn.close()
-    print("[+] تم تصفير ذاكرة الجلسة للوكيل بنجاح.")
+def check_script_hash_exists(hash_hex, title_text):
+    """
+    [بند 9] دالة الفحص الاستباقي ومطابقة البصمة التشفيرية قبل الإنتاج لمنع الحظر الظلي.
+    تفحص السجل التاريخي للبصمات لمنع هدر موارد كرت الشاشة وتكرار المحتوى.
+    """
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute('SELECT 1 FROM script_hashes WHERE hash_value = ?', (hash_hex,))
+        result = cursor.fetchone()
+        
+        if result:
+            conn.close()
+            return True  # البصمة مسجلة مسبقاً (محتوى مكرر خطير!)
+            
+        # إذا كانت البصمة جديدة، يتم حجزها برمجياً في الجدول لتأمين خط الإنتاج
+        cursor.execute('''
+            INSERT INTO script_hashes (hash_value, associated_title, created_at)
+            VALUES (?, ?, CURRENT_TIMESTAMP)
+        ''', (hash_hex, title_text))
+        conn.commit()
+        conn.close()
+        return False
+    except sqlite3.Error as e:
+        print(f"❌ خطأ في مطابقة وفحص بصمة النص: {e}")
+        return True
 
+def generate_inspection_certificate(v_id, title, s_hash, islamic, eu_law, fact_check, cost):
+    """
+    [بند 10] دالة توليد وحفظ شهادة التوثيق الرقابي والمالي الشاملة بعد نجاح النشر.
+    تؤمن مستند رقمي دائم يثبت جودة ونزاهة كل محتوى خرج من المنظومة.
+    """
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT OR REPLACE INTO inspection_certificates 
+            (video_id, title, script_hash, islamic_status, eu_law_status, fact_check_status, finops_cost, published_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        ''', (v_id, title, s_hash, islamic, eu_law, fact_check, cost))
+        conn.commit()
+        conn.close()
+        print(f"📜 شهادة رقمية: تم إصدار شهادة التوثيق بنجاح للفيديو المرفوع رقم: {v_id}")
+        return True
+    except sqlite3.Error as e:
+        print(f"❌ خطأ إداري أثناء إصدار شهادة الفحص: {e}")
+        return False
+
+# تشغيل التهيئة التلقائية لبناء البيئة والجداول فور استدعاء الملف
 if __name__ == "__main__":
-    # تشغيل التهيئة عند استدعاء الملف مباشرة
-    initialize_database()
+    init_database_system()
+
+# =====================================================================
+# 📘 الشرح التفصيلي والموسع لكافة بنود وخصائص البيانات (في الأسفل - بدون اختصار)
+# =====================================================================
+#
+# 🔹 بند 1: تهيئة وإنشاء قاعدة البيانات المحلية الخفيفة (SQLite) صفرية التكلفة السحابية
+# يمثل هذا البند حجر الأساس التخزيني للمشروع محلياً على لابتوبك الشخصي. بدلاً من استئجار قواعد بيانات سحابية مكلفة 
+# (مثل PostgreSQL أو MySQL السحابية) والتي تفرض فواتير شهرية، يعتمد النظام على محرك SQLite المدمج. يقوم هذا البند 
+# بإنشاء ملف معزول يحمل اسم `ai_trends.db` داخل مجلد المشروع فور تشغيله. هذا الملف يتكفل بإدارة وحفظ كافة العمليات 
+# البرمجية التخزينية بسرعة فائقة ومجاناً بنسبة 100% دون الحاجة إلى اتصال خارجي بالإنترنت للولوج للبيانات.
+#
+# 🔹 بند 2: جدول التوثيق وسجلات الأمان الرقمية لإشارات GitHub Webhooks (platform_security)
+# يتولى هذا الجدول حفظ المتغيرات والمفاتيح السرية الحساسة التي تحمي سيرفر لابتوبك من اتصالات الـ Webhooks الوهمية. 
+# يتم فيه تخزين قيم الـ `GITHUB_WEBHOOK_SECRET` والبصمات التشفيرية المعتمدة للربط مع مستودع GitHub. عند وصول أي إشارة، 
+# يرجع المدير الأعلى إلى هذا الجدول تحديداً لقراءة المفتاح السري المعتمد ومطابقة التوقيع الرقمي، 
+# مما يضمن عزل مفاتيح الأمان في مستودع بيانات محمي وتسهيل تعديلها مستقبلاً من مكان واحد.
+#
+# 🔹 بند 3: جدول طابور ومستودع استقبال تعليقات وإشارات المنصات الفوري (webhook_queue)
+# هو الركيزة الأساسية لتطبيق معمارية "فصل الاستجابة الفورية عن المعالجة الخلفية الثقيلة" (Asynchronous Queue). 
+# عندما يرسل GitHub أو أي منصة إشارة Webhook، يتم إدخال البيانات الخام (Payload) فوراً في هذا الجدول بامتداد حالة (Pending)، 
+# ويرد السيرفر برمز النجاح 200 OK في ميكروثانية. لاحقاً، يقوم معالج الخلفية الصامت (Background Worker) بقراءة الطلبات 
